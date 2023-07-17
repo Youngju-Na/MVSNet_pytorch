@@ -5,9 +5,32 @@ from PIL import Image
 from datasets.data_io import *
 
 
+def load_K_Rt_from_P(filename, P=None):
+    if P is None:
+        lines = open(filename).read().splitlines()
+        if len(lines) == 4:
+            lines = lines[1:]
+        lines = [[x[0], x[1], x[2], x[3]] for x in (x.split(" ") for x in lines)]
+        P = np.asarray(lines).astype(np.float32).squeeze()
+
+    out = cv2.decomposeProjectionMatrix(P)
+    K = out[0]
+    R = out[1]
+    t = out[2]
+
+    K = K / K[2, 2]
+    intrinsics = np.eye(4)
+    intrinsics[:3, :3] = K
+
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = R.transpose()
+    pose[:3, 3] = (t[:3] / t[3])[:, 0]
+
+    return intrinsics, pose
+
 # the DTU dataset preprocessed by Yao Yao (only for training)
 class MVSDataset(Dataset):
-    def __init__(self, datapath, listfile, mode, nviews, ndepths=192, interval_scale=1.06, **kwargs):
+    def __init__(self, datapath, listfile, mode, nviews, ndepths=192, interval_scale=1.06, img_wh=(640, 512), **kwargs):
         super(MVSDataset, self).__init__()
         self.datapath = datapath
         self.listfile = listfile
@@ -15,6 +38,7 @@ class MVSDataset(Dataset):
         self.nviews = nviews
         self.ndepths = ndepths
         self.interval_scale = interval_scale
+        self.img_wh = img_wh
 
         assert self.mode in ["train", "val", "test"]
         self.metas = self.build_list()
@@ -55,7 +79,8 @@ class MVSDataset(Dataset):
         # depth_min & depth_interval: line 11
         depth_min = float(lines[11].split()[0])
         depth_interval = float(lines[11].split()[1]) * self.interval_scale
-        return intrinsics, extrinsics, depth_min, depth_interval
+        depth_max = depth_min + depth_interval * self.ndepths
+        return intrinsics, extrinsics, depth_min, depth_interval, depth_max
 
     def read_img(self, filename):
         img = Image.open(filename)
@@ -64,8 +89,11 @@ class MVSDataset(Dataset):
         return np_img
 
     def read_depth(self, filename):
-        # read pfm depth file
-        return np.array(read_pfm(filename)[0], dtype=np.float32)
+        depth_h = np.array(read_pfm(filename)[0], dtype=np.float32)  # (1200, 1600)
+        depth_h = cv2.resize(depth_h, None, fx=0.5, fy=0.5,
+                             interpolation=cv2.INTER_NEAREST)  # (600, 800)
+        depth_h = depth_h[44:556, 80:720]  # (512, 640)
+        return depth_h
 
     def __getitem__(self, idx):
         meta = self.metas[idx]
@@ -78,7 +106,10 @@ class MVSDataset(Dataset):
         depth = None
         depth_values = None
         proj_matrices = []
-
+        near_fars = []
+        w2cs = []
+        intrinsics = []
+        depths_h = []
         for i, vid in enumerate(view_ids):
             # NOTE that the id in image file names is from 1 to 49 (not 0~48)
             img_filename = os.path.join(self.datapath,
@@ -88,25 +119,62 @@ class MVSDataset(Dataset):
             proj_mat_filename = os.path.join(self.datapath, 'Cameras/train/{:0>8}_cam.txt').format(vid)
 
             imgs.append(self.read_img(img_filename))
-            intrinsics, extrinsics, depth_min, depth_interval = self.read_cam_file(proj_mat_filename)
+            intrinsic, extrinsic, depth_min, depth_interval, depth_max = self.read_cam_file(proj_mat_filename)
 
             # multiply intrinsics and extrinsics to get projection matrix
-            proj_mat = extrinsics.copy()
-            proj_mat[:3, :4] = np.matmul(intrinsics, proj_mat[:3, :4])
+            proj_mat = extrinsic.copy()
+            proj_mat[:3, :4] = np.matmul(intrinsic, proj_mat[:3, :4])
             proj_matrices.append(proj_mat)
-
+            
+            #* ----------- I added lines from here -------------------------------
+            near_fars.append([depth_min, depth_max])
+            w2cs.append(extrinsic)
+            intrinsics.append(intrinsic)
+            depths_h.append(self.read_depth(depth_filename))
+            #* ------------ to here ---------------------------------------------
+            
             if i == 0:  # reference view
                 depth_values = np.arange(depth_min, depth_interval * self.ndepths + depth_min, depth_interval,
                                          dtype=np.float32)
                 mask = self.read_img(mask_filename)
                 depth = self.read_depth(depth_filename)
 
+        #* ----------- I added lines from here -------------------------------
+        scale_mat, scale_factor = self.cal_scale_mat(img_hw=[self.img_wh[1], self.img_wh[0]],
+                                                     intrinsics=intrinsics, extrinsics=w2cs,
+                                                     near_fars=near_fars, factor=1.1)
+        
+        new_near_fars = []
+        new_w2cs = []
+        new_c2ws = []
+        new_depths_h = []
+        new_proj_matrices = []
+        for intrinsic, extrinsic, depth in zip(intrinsics, w2cs, depths_h):
+            P = intrinsic @ extrinsic @ scale_mat # perspective matrix
+            P = P[:3, :4] # 
+            c2w = load_K_Rt_from_P(None, P)[1]
+
+            w2c = np.linalg.inv(c2w)
+            new_w2cs.append(w2c)
+            new_c2ws.append(c2w)
+
+            camera_o = c2w[:3, 3]
+            dist = np.sqrt(np.sum(camera_o ** 2))
+            near = dist - 1
+            far = dist + 1
+            new_near_fars.append([0.95 * near, 1.05 * far])
+            new_depths_h.append(depth * scale_factor)
+            
+            new_proj_matrices.append(P)
+        
         imgs = np.stack(imgs).transpose([0, 3, 1, 2])
-        proj_matrices = np.stack(proj_matrices)
+        proj_matrices = np.stack(new_proj_matrices)
+
+        depth_values = depth_values * scale_factor
 
         return {"imgs": imgs,
                 "proj_matrices": proj_matrices,
-                "depth": depth,
+                "depth": new_depths_h[0],
                 "depth_values": depth_values,
                 "mask": mask}
 
